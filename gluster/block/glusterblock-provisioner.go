@@ -38,14 +38,15 @@ import (
 )
 
 const (
-	provisionerName  = "gluster.org/glusterblock"
-	defaultExecPath  = "./createiscsi"
-	secretKeyName    = "key"
-	shareIDAnn       = "glusterBlockShare"
-	provisionerIDAnn = "glusterBlockProvisionerIdentity"
-	creatorAnn       = "kubernetes.io/createdby"
-	volumeTypeAnn    = "gluster.org/type"
-	descriptionAnn   = "Description"
+	provisionerName    = "gluster.org/glusterblock"
+	defaultExecPath    = "./createiscsi"
+	secretKeyName      = "key"
+	shareIDAnn         = "glusterBlockShare"
+	provisionerIDAnn   = "glusterBlockProvisionerIdentity"
+	creatorAnn         = "kubernetes.io/createdby"
+	volumeTypeAnn      = "gluster.org/type"
+	descriptionAnn     = "Description"
+	provisionerVersion = "v0.5"
 )
 
 type glusterBlockProvisioner struct {
@@ -131,11 +132,12 @@ func (p *glusterBlockProvisioner) Provision(options controller.VolumeOptions) (*
 		ObjectMeta: metav1.ObjectMeta{
 			Name: options.PVName,
 			Annotations: map[string]string{
-				provisionerIDAnn: p.identity,
-				shareIDAnn:       blockVolIdentity,
-				creatorAnn:       "heketi-dynamic-provisioner",
-				volumeTypeAnn:    "block",
-				descriptionAnn:   "Gluster: Dynamically provisioned PV",
+				provisionerIDAnn:   p.identity,
+				provisionerVersion: provisionerVersion,
+				shareIDAnn:         blockVolIdentity,
+				creatorAnn:         "heketi-dynamic-provisioner",
+				volumeTypeAnn:      "block",
+				descriptionAnn:     "Gluster: Dynamically provisioned PV",
 			},
 		},
 		Spec: v1.PersistentVolumeSpec{
@@ -164,7 +166,7 @@ func (p *glusterBlockProvisioner) Provision(options controller.VolumeOptions) (*
 func (p *glusterBlockProvisioner) createVolume(PVName string) (string, string, error) {
 	var dtarget, diqn string
 	if p.provConfig.opMode == "executable" {
-		cmd := exec.Command("sh", p.provConfig.execPath)
+		cmd := exec.Command(p.provConfig.execPath)
 		err := cmd.Run()
 		if err != nil {
 			glog.Errorf("%v", err)
