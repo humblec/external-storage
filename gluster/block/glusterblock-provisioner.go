@@ -47,6 +47,7 @@ const (
 	volumeTypeAnn      = "gluster.org/type"
 	descriptionAnn     = "Description"
 	provisionerVersion = "v0.5"
+	chapType           = "kubernetes.io/iscsi-chap"
 )
 
 type glusterBlockProvisioner struct {
@@ -127,6 +128,34 @@ func (p *glusterBlockProvisioner) Provision(options controller.VolumeOptions) (*
 
 	// Create unique PVC identity.
 	blockVolIdentity := fmt.Sprintf("kubernetes-dynamic-pvc-%s", uuid.NewUUID())
+	nameSpace := options.PVC.Namespace
+
+	// Todo: fetch user from response.
+	user := fmt.Sprintf("glusterblock-dynamic-user-%s", uuid.NewUUID())
+	password := "4a5c9b84-3a6d-44b4-9668-c9a6d699a5e9"
+	secretName := "glusterblk-" + user + "-secret"
+
+	if user != "" && password != "" {
+		secret := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: nameSpace,
+				Name:      secretName,
+			},
+			Data: map[string][]byte{
+				"node.session.auth.username": []byte(user),
+				"node.session.auth.password": []byte(password),
+			},
+			Type: chapType,
+		}
+		_, err = p.client.Core().Secrets(nameSpace).Create(secret)
+		if err != nil {
+			return nil, fmt.Errorf("gluster block failed to create secret")
+		}
+		secretRef := &v1.LocalObjectReference{Name: secretName}
+		glog.V(1).Infof("gluster block secret [%v]: secretRef [%v]", secret, secretRef)
+	} else {
+		glog.V(1).Infof("gluster block response does not contain username and password")
+	}
 
 	pv := &v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
@@ -153,6 +182,8 @@ func (p *glusterBlockProvisioner) Provision(options controller.VolumeOptions) (*
 					Lun:          0,
 					FSType:       "ext4",
 					ReadOnly:     false,
+					//chapAuthSession: true,
+					//SecretRef:       secretRef,
 				},
 			},
 		},
@@ -288,7 +319,7 @@ func parseClassParameters(params map[string]string, kubeclient kubernetes.Interf
 // parseSecret finds a given Secret instance and reads user password from it.
 func parseSecret(namespace, secretName string, kubeClient kubernetes.Interface) (string, error) {
 
-	secretMap, err := GetSecretForPV(namespace, secretName, "glusterblock", kubeClient)
+	secretMap, err := GetSecretForPV(namespace, secretName, provisionerName, kubeClient)
 	if err != nil {
 		glog.Errorf("failed to get secret %s/%s: %v", namespace, secretName, err)
 		return "", fmt.Errorf("failed to get secret %s/%s: %v", namespace, secretName, err)
