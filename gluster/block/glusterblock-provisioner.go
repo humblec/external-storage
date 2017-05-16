@@ -49,9 +49,11 @@ const (
 	provisionerIDAnn   = "glusterBlockProvisionerIdentity"
 	creatorAnn         = "kubernetes.io/createdby"
 	volumeTypeAnn      = "gluster.org/type"
-	descriptionAnn     = "Description"
+	descAnn            = "Gluster: Dynamically provisioned PV"
 	provisionerVersion = "v0.6"
 	chapType           = "kubernetes.io/iscsi-chap"
+	heketiAnn          = "heketi-dynamic-provisioner"
+	volPrefix          = "blockvol-"
 )
 
 type glusterBlockProvisioner struct {
@@ -90,13 +92,11 @@ type provisionerConfig struct {
 	// Optional: high availability count in case of multipathing
 	haCount int
 
-	// Optional: Operation mode  (heketi, gluster-block, executable)
+	// Optional: Operation mode  (heketi, gluster-block)
 	opMode string
 
-	// Optional: Executable path if we are operating in executable mode.
-	execPath string
-
-	blockCommandArgs map[string]string
+	// Optional: Gluster Block command Args or Heketi command args
+	blockModeArgs map[string]string
 }
 
 type glusterBlockVolume struct {
@@ -186,9 +186,9 @@ func (p *glusterBlockProvisioner) Provision(options controller.VolumeOptions) (*
 				provisionerIDAnn:   p.identity,
 				provisionerVersion: provisionerVersion,
 				shareIDAnn:         blockVolIdentity,
-				creatorAnn:         "heketi-dynamic-provisioner",
+				creatorAnn:         heketiAnn,
 				volumeTypeAnn:      "block",
-				descriptionAnn:     "Gluster: Dynamically provisioned PV",
+				"Description":      descAnn,
 			},
 		},
 		Spec: v1.PersistentVolumeSpec{
@@ -227,22 +227,10 @@ func (p *glusterBlockProvisioner) createVolume(PVName string) (*glusterBlockVolu
 	glog.V(2).Infof("glusterfs: create volume of size: %d bytes and configuration %+v", volSizeBytes, p.provConfig)
 
 	switch p.provConfig.opMode {
-
-	case "executable":
-		cmd := exec.Command(p.provConfig.execPath)
-		_, cmdErr := cmd.CombinedOutput()
-		if cmdErr != nil {
-			glog.Errorf("glusterblock: error [%v] when running command %v", cmdErr, cmd)
-			return nil, cmdErr
-		}
-		// Fetch details from environment variables.
-		p.volConfig.TargetPortal = os.Getenv("TARGET")
-		p.volConfig.Iqn = os.Getenv("IQN")
-
 	case "gluster-block":
-		blockVol := "demo2" + string(uuid.NewUUID())
+		blockVol := volPrefix + string(uuid.NewUUID())
 		haCountStr := "1"
-		cmd := exec.Command(p.provConfig.opMode, "create", p.provConfig.blockCommandArgs["glustervol"]+"/"+blockVol, "ha", haCountStr, p.provConfig.blockCommandArgs["confighosts"], "2GiB", "--json")
+		cmd := exec.Command(p.provConfig.opMode, "create", p.provConfig.blockModeArgs["glustervol"]+"/"+blockVol, "ha", haCountStr, p.provConfig.blockModeArgs["confighosts"], "2GiB", "--json")
 		out, cmdErr := cmd.CombinedOutput()
 		if cmdErr != nil {
 			glog.Errorf("glusterblock: error [%v] when running command %v", cmdErr, cmd)
@@ -267,7 +255,6 @@ func (p *glusterBlockProvisioner) createVolume(PVName string) (*glusterBlockVolu
 
 		//TODO:
 		sz, _ := strconv.Atoi(volSizeBytes)
-
 		volumeReq := &gapi.VolumeCreateRequest{Size: sz}
 		_, err := cli.VolumeCreate(volumeReq)
 		if err != nil {
@@ -363,51 +350,32 @@ func parseClassParameters(params map[string]string, kubeclient kubernetes.Interf
 		parseOpmodeInfo := dstrings.Split(parseOpmode, ":")
 
 		switch parseOpmodeInfo[0] {
-		case "executable":
-			if len(parseOpmodeInfo) >= 2 {
-				cfg.opMode = "executable"
-				cfg.execPath = parseOpmodeInfo[1]
-			} else {
-				return nil, fmt.Errorf("StorageClass for provisioner %s contains wrong number of arguments for %s", "glusterblock", parseOpmode)
-			}
+
 		case "gluster-block":
 			if len(parseOpmodeInfo) >= 2 {
 				cfg.opMode = "gluster-block"
-				cfg.blockCommandArgs = make(map[string]string)
-				blockCommandStr := parseOpmodeInfo[1]
-				blockCommandParams := dstrings.Split(blockCommandStr, ",")
-				for _, v := range blockCommandParams {
-					paramInfo := dstrings.Split(v, "=")
-					switch paramInfo[0] {
-					case "glustervol":
-						volName := dstrings.Split(v, "=")[1]
-						if volName != "" {
-							cfg.blockCommandArgs["glustervol"] = volName
-						} else {
-							return nil, fmt.Errorf("StorageClass for provisioner %s must contain 'glustervol' parameter ", "glusterblock")
-						}
-					case "confighosts":
-						if dstrings.Split(v, "=")[1] != "" {
-							cfg.blockCommandArgs["confighosts"] = dstrings.Split(v, "=")[1]
-						} else {
-							return nil, fmt.Errorf("StorageClass for provisioner %s must contain 'confighosts' parameter", "glusterblock")
-						}
-					default:
-						return nil, fmt.Errorf("StorageClass for provisioner %s contains unknown [%v] parameter", "glusterblock", paramInfo[0])
-					}
+				argsDict, err := parseBlockModeArgs(cfg.opMode, parseOpmodeInfo[1])
+				if err != nil {
+					glog.Errorf("Failed to parse gluster-block arguments")
+					return nil, fmt.Errorf("Failed to parse gluster-block arguments")
 				}
+
+				cfg.blockModeArgs = *argsDict
 			} else {
 				return nil, fmt.Errorf("StorageClass for provisioner %s contains wrong number of arguments for %s", "glusterblock", parseOpmode)
 			}
 		case "heketi":
+			if len(parseOpmodeInfo) >= 2 {
+				cfg.opMode = "heketi"
+
+			} else {
+				return nil, fmt.Errorf("StorageClass for provisioner %s contains wrong number of arguments for %s", "heketi", parseOpmode)
+			}
 		default:
 			return nil, fmt.Errorf("StorageClass for provisioner %s contains unknown [%v] parameter", "glusterblock", parseOpmodeInfo[0])
 		}
 	}
 
-	if len(cfg.execPath) == 0 {
-		cfg.execPath = defaultExecPath
-	}
 	if !authEnabled {
 		cfg.user = ""
 		cfg.secretName = ""
@@ -431,6 +399,34 @@ func parseClassParameters(params map[string]string, kubeclient kubernetes.Interf
 	}
 
 	return &cfg, nil
+}
+
+func parseBlockModeArgs(mode string, inArgs string) (*map[string]string, error) {
+	modeArgs := make(map[string]string)
+	modeCommandParams := dstrings.Split(inArgs, ",")
+	glog.Errorf("ModeCommandParams: %v", modeCommandParams)
+	for _, v := range modeCommandParams {
+		paramInfo := dstrings.Split(v, "=")
+		glog.Errorf(" Parameters: %v", paramInfo)
+		switch paramInfo[0] {
+		case "glustervol":
+			volName := dstrings.Split(v, "=")[1]
+			if volName != "" {
+				modeArgs["glustervol"] = volName
+			} else {
+				return nil, fmt.Errorf("StorageClass for provisioner %s must contain valid parameter for %v ", "glusterblock", "glustervol")
+			}
+		case "confighosts":
+			if dstrings.Split(v, "=")[1] != "" {
+				modeArgs["confighosts"] = dstrings.Split(v, "=")[1]
+			} else {
+				return nil, fmt.Errorf("StorageClass for provisioner %s must contain valid  parameter for %v", "glusterblock", "confighosts")
+			}
+		default:
+			return nil, fmt.Errorf("parseBlockModeArgs: StorageClass for provisioner %s must contain valid parameter for %v", "glusterblock", mode)
+		}
+	}
+	return &modeArgs, nil
 }
 
 // parseSecret finds a given Secret instance and reads user password from it.
