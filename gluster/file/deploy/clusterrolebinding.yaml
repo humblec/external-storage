@@ -1,0 +1,12 @@
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1alpha1
+metadata:
+  name: run-glusterfs-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: glusterfs-provisioner
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: glusterfs-provisioner-runner
+  apiGroup: rbac.authorization.k8s.io

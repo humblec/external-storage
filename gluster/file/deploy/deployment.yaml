@@ -1,0 +1,21 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: glusterfs-provisioner
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: glusterfs-provisioner
+    spec:
+      containers:
+        -
+          env:
+            -
+              name: PROVISIONER_NAME
+              value: gluster.org/glusterfs
+          image: "quay.io/external_storage/glusterfs-provisioner:latest"
+          name: glusterfs-provisioner
