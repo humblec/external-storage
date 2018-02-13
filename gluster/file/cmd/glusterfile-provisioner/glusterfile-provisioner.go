@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
 )
 
 const (
@@ -52,6 +53,15 @@ const (
 	glusterTypeAnn     = "gluster.org/type"
 	heketiVolIDAnn     = "gluster.kubernetes.io/heketi-volume-id"
 	gidAnn             = "pv.beta.kubernetes.io/gid"
+
+	// CloneRequestAnn is an annotation to request that the PVC be provisioned as a clone of the referenced PVC
+	CloneRequestAnn = "k8s.io/CloneRequest"
+
+	// CloneOfAnn is an annotation to indicate that a PVC is a clone of the referenced PVC
+	CloneOfAnn = "k8s.io/CloneOf"
+
+	// SmartCloneEnabled is a provisioner parameter to enable smart clone mode for a storage class
+	SmartCloneEnabled = "smartclone"
 )
 
 type glusterfileProvisioner struct {
@@ -96,6 +106,32 @@ func (p *glusterfileProvisioner) GetAccessModes() []v1.PersistentVolumeAccessMod
 	}
 }
 
+func (p *glusterfileProvisioner) getPVC(ns string, name string) (*v1.PersistentVolumeClaim, error) {
+	return p.client.CoreV1().PersistentVolumeClaims(ns).Get(name, metav1.GetOptions{})
+}
+
+func (p *glusterfileProvisioner) annotatePVC(ns string, name string, updates map[string]string) error {
+	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Retrieve the latest version of PVC before attempting update
+		// RetryOnConflict uses exponential backoff to avoid exhausting the apiserver
+		result, getErr := p.client.CoreV1().PersistentVolumeClaims(ns).Get(name, metav1.GetOptions{})
+		if getErr != nil {
+			panic(fmt.Errorf("Failed to get latest version of PVC: %v", getErr))
+		}
+
+		for k, v := range updates {
+			result.Annotations[k] = v
+		}
+		_, updateErr := p.client.CoreV1().PersistentVolumeClaims(ns).Update(result)
+		return updateErr
+	})
+	if retryErr != nil {
+		glog.Errorf("Update failed: %v", retryErr)
+		return retryErr
+	}
+	return nil
+}
+
 // Provision creates a storage asset and returns a PV object representing it.
 func (p *glusterfileProvisioner) Provision(options controller.VolumeOptions) (*v1.PersistentVolume, error) {
 
@@ -109,9 +145,13 @@ func (p *glusterfileProvisioner) Provision(options controller.VolumeOptions) (*v
 
 	glog.V(1).Infof(" VolumeOptions %v", options)
 	p.options = options
+	cloneEnabled := false
 	gidAllocate := true
 	for k, v := range options.Parameters {
 		switch dstrings.ToLower(k) {
+		case SmartCloneEnabled:
+			cloneEnabled = true
+
 		case "gidmin":
 		// Let allocator handle
 		case "gidmax":
@@ -141,6 +181,30 @@ func (p *glusterfileProvisioner) Provision(options controller.VolumeOptions) (*v
 		return nil, fmt.Errorf(" failed to parse storage class parameters: %v", parseErr)
 	}
 
+	sourceVolID := ""
+	if cloneEnabled {
+		if sourcePVCRef, ok := options.PVC.Annotations[CloneRequestAnn]; ok {
+			var ns string
+			parts := dstrings.SplitN(sourcePVCRef, "/", 2)
+			if len(parts) < 2 {
+				ns = options.PVC.Namespace
+			} else {
+				ns = parts[0]
+			}
+			sourcePVCName := parts[len(parts)-1]
+			sourcePVC, err := p.getPVC(ns, sourcePVCName)
+			if err != nil {
+				return nil, fmt.Errorf("Unable to get PVC %s/%s", ns, sourcePVCName)
+			}
+			if sourceVolID, ok = sourcePVC.Annotations[heketiVolIDAnn]; ok {
+				glog.Infof("Requesting clone of heketi volumeID %s", sourceVolID)
+			} else {
+				return nil, fmt.Errorf("PVC %s/%s missing %s annotation",
+					ns, sourcePVCName, heketiVolIDAnn)
+			}
+		}
+	}
+
 	glog.V(4).Infof(" creating volume with configuration %+v", *cfg)
 
 	modeAnn := "url:" + cfg.url + "," + "user:" + cfg.user + "," + "secret:" + cfg.secretName + "," + "secretnamespace:" + cfg.secretNamespace
@@ -151,10 +215,25 @@ func (p *glusterfileProvisioner) Provision(options controller.VolumeOptions) (*v
 	volSizeBytes := volSize.Value()
 	volszInt := int(util.RoundUpToGiB(volSizeBytes))
 
+	if cloneEnabled {
+
+		//TODO: if else or same createcall with a new param.
+		glog.V(1).Infof("Cloning volume: %v", sourceVolID)
+	}
+
 	glusterfs, sizeGiB, volID, err := p.CreateVolume(gid, cfg, volszInt)
 	if err != nil {
 		glog.Errorf("create volume error: %v.", err)
 		return nil, fmt.Errorf("create volume error: %v", err)
+	}
+
+	if cloneEnabled {
+		err = p.annotateClonedPVC(volID, options.PVC, sourceVolID)
+		if err != nil {
+			glog.Errorf("Failed to annotate cloned PVC: %v", err)
+			//todo: May be cleanup
+		}
+
 	}
 
 	pv := &v1.PersistentVolume{
@@ -182,6 +261,22 @@ func (p *glusterfileProvisioner) Provision(options controller.VolumeOptions) (*v
 	}
 	glog.V(1).Infof("successfully created Gluster File volume %+v with size", pv.Spec.PersistentVolumeSource.Glusterfs, sizeGiB)
 	return pv, nil
+}
+
+func (p *glusterfileProvisioner) annotateClonedPVC(VolID string, pvc *v1.PersistentVolumeClaim, SourceVolID string) error {
+	annotations := make(map[string]string, 2)
+	annotations[heketiVolIDAnn] = VolID
+
+	// Add clone annotation if this is a cloned volume
+	if sourcePVCName, ok := pvc.Annotations[CloneRequestAnn]; ok {
+		if SourceVolID != "" {
+			glog.Infof("Annotating PVC %s/%s as a clone of PVC %s/%s",
+				pvc.Namespace, pvc.Name, pvc.Namespace, sourcePVCName)
+			annotations[CloneOfAnn] = sourcePVCName
+		}
+	}
+	err := p.annotatePVC(pvc.Namespace, pvc.Name, annotations)
+	return err
 }
 
 func (p *glusterfileProvisioner) CreateVolume(gid *int, config *provisionerConfig, sz int) (r *v1.GlusterfsVolumeSource, size int, volID string, err error) {
